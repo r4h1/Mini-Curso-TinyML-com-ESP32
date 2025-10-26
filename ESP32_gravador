@@ -1,0 +1,46 @@
+// 2_ESP32_GRAVADOR.ino
+#include "driver/i2s.h"
+
+// --- Configurações ---
+#define I2S_PORT i2s_port_t(0)
+#define I2S_SAMPLE_RATE 16000
+#define TOTAL_SAMPLES_TO_CAPTURE 16000
+#define CHUNK_SIZE_IN_BYTES 1024 
+#define I2S_BCK_IO GPIO_NUM_14
+#define I2S_WS_IO GPIO_NUM_15
+#define I2S_DI_IO GPIO_NUM_32
+
+void setup() {
+  Serial.begin(115200);
+  
+  i2s_config_t i2s_config = { /* ...código de config do I2S (igual ao teste)... */ };
+  i2s_pin_config_t pin_config = { /* ...código de config dos pinos (igual ao teste)... */ };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  Serial.println("ESP32 pronto. Envie 'R' para gravar.");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    char command = Serial.read();
+    if (command == 'R') {
+      Serial.write('A'); // Envia confirmação (Handshake)
+      
+      size_t total_bytes_read = 0;
+      size_t bytes_to_read = TOTAL_SAMPLES_TO_CAPTURE * sizeof(int32_t);
+      uint8_t chunk_buffer[CHUNK_SIZE_IN_BYTES];
+
+      while (total_bytes_read < bytes_to_read) {
+        size_t bytes_read_this_loop = 0;
+        i2s_read(I2S_PORT, &chunk_buffer, CHUNK_SIZE_IN_BYTES, &bytes_read_this_loop, portMAX_DELAY);
+        if (bytes_read_this_loop > 0) {
+          Serial.write(chunk_buffer, bytes_read_this_loop);
+          total_bytes_read += bytes_read_this_loop;
+        }
+      }
+    }
+  }
+}
