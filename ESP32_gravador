@@ -1,46 +1,84 @@
-// 2_ESP32_GRAVADOR.ino
+/*
+ * Versão Final para Gravação (Mono 16 bits + Handshake + I2S Estável)
+ * Compatível com o script Python que espera 16 bits mono.
+ */
+
 #include "driver/i2s.h"
 
 // --- Configurações ---
-#define I2S_PORT i2s_port_t(0)
+#define I2S_PORT i2s_port_t(0) // Mudança para i2s_port_t(0)
 #define I2S_SAMPLE_RATE 16000
-#define TOTAL_SAMPLES_TO_CAPTURE 16000
-#define CHUNK_SIZE_IN_BYTES 1024 
+#define TOTAL_SAMPLES_TO_CAPTURE 16000 // 1 segundo
+#define CHUNK_SAMPLES 256             // Amostras lidas por vez do I2S
+
+// Pinos I2S (Verifique se correspondem à sua placa WROVER)
 #define I2S_BCK_IO GPIO_NUM_14
-#define I2S_WS_IO GPIO_NUM_15
-#define I2S_DI_IO GPIO_NUM_32
+#define I2S_WS_IO  GPIO_NUM_15
+#define I2S_DI_IO  GPIO_NUM_32
 
 void setup() {
   Serial.begin(115200);
-  
-  i2s_config_t i2s_config = { /* ...código de config do I2S (igual ao teste)... */ };
-  i2s_pin_config_t pin_config = { /* ...código de config dos pinos (igual ao teste)... */ };
+  delay(1000);
+
+  i2s_config_t i2s_config = {
+      .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+      .sample_rate = I2S_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // O hardware lê em 32 bits
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, // Formato padrão do INMP441
+      .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+      .intr_alloc_flags = 0,
+      .dma_buf_count = 16, // Valor estável
+      .dma_buf_len = 128,  // Valor estável
+      .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+      .bck_io_num = I2S_BCK_IO,
+      .ws_io_num = I2S_WS_IO,
+      .data_out_num = I2S_PIN_NO_CHANGE,
+      .data_in_num = I2S_DI_IO
+  };
 
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
   i2s_set_pin(I2S_PORT, &pin_config);
   i2s_zero_dma_buffer(I2S_PORT);
 
-  Serial.println("ESP32 pronto. Envie 'R' para gravar.");
+  Serial.println("ESP32 pronto (16 bits mono). Envie 'R' para gravar.");
 }
 
 void loop() {
   if (Serial.available() > 0) {
     char command = Serial.read();
     if (command == 'R') {
-      Serial.write('A'); // Envia confirmação (Handshake)
-      
-      size_t total_bytes_read = 0;
-      size_t bytes_to_read = TOTAL_SAMPLES_TO_CAPTURE * sizeof(int32_t);
-      uint8_t chunk_buffer[CHUNK_SIZE_IN_BYTES];
+      Serial.write('A'); // Handshake
 
-      while (total_bytes_read < bytes_to_read) {
-        size_t bytes_read_this_loop = 0;
-        i2s_read(I2S_PORT, &chunk_buffer, CHUNK_SIZE_IN_BYTES, &bytes_read_this_loop, portMAX_DELAY);
-        if (bytes_read_this_loop > 0) {
-          Serial.write(chunk_buffer, bytes_read_this_loop);
-          total_bytes_read += bytes_read_this_loop;
+      // Buffer temporário para ler do I2S (32 bits, estéreo/intercalado)
+      int32_t buffer_32bit_i2s[CHUNK_SAMPLES * 2]; // *2 para formato RIGHT_LEFT
+      // Buffer para enviar via Serial (16 bits, mono)
+      int16_t buffer_16bit_mono[CHUNK_SAMPLES];
+      size_t total_samples_sent = 0;
+
+      while (total_samples_sent < TOTAL_SAMPLES_TO_CAPTURE) {
+        size_t bytes_read = 0;
+        // Lê um chunk de dados do I2S
+        i2s_read(I2S_PORT, (void*)buffer_32bit_i2s, sizeof(buffer_32bit_i2s), &bytes_read, portMAX_DELAY);
+        int samples_read_i2s = bytes_read / sizeof(int32_t); // Quantidade de amostras de 32 bits lidas
+
+        // Calcula quantas amostras mono de 16 bits isso representa
+        int samples_to_send = samples_read_i2s / 2; // Dividido por 2 por causa do formato RIGHT_LEFT
+
+        // Converte para mono 16 bits (pegando apenas um canal e deslocando os bits)
+        for (int i = 0; i < samples_to_send; i++) {
+            // Pega amostra do canal esquerdo (índice par) e converte
+             buffer_16bit_mono[i] = (int16_t)(buffer_32bit_i2s[i * 2] >> 14);
         }
+
+        // Envia o chunk convertido via Serial
+        Serial.write((uint8_t*)buffer_16bit_mono, samples_to_send * sizeof(int16_t));
+        total_samples_sent += samples_to_send;
       }
+      // Opcional: Enviar uma pequena mensagem de fim pode ajudar o Python a sincronizar melhor
+      Serial.println("DONE"); 
     }
   }
 }
