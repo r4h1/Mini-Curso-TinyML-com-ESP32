@@ -1,0 +1,59 @@
+// 1_TESTE_MICROFONE.ino
+#include "driver/i2s.h"
+
+// --- Configurações do I2S ---
+#define I2S_PORT i2s_port_t(0)
+#define I2S_SAMPLE_RATE 16000
+#define I2S_READ_LEN 1024
+
+// --- Pinos do I2S ---
+#define I2S_BCK_IO GPIO_NUM_14
+#define I2S_WS_IO GPIO_NUM_15
+#define I2S_DI_IO GPIO_NUM_32
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Configurando I2S...");
+
+  i2s_config_t i2s_config = {
+      .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+      .sample_rate = I2S_SAMPLE_RATE,
+      .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+      .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+      .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+      .intr_alloc_flags = 0,
+      .dma_buf_count = 16, // Valor estável para o Core v2.0.11
+      .dma_buf_len = 128,  // Valor estável para o Core v2.0.11
+      .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+      .bck_io_num = I2S_BCK_IO,
+      .ws_io_num = I2S_WS_IO,
+      .data_out_num = I2S_PIN_NO_CHANGE,
+      .data_in_num = I2S_DI_IO
+  };
+
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_PORT, &pin_config);
+  i2s_zero_dma_buffer(I2S_PORT);
+
+  Serial.println("I2S configurado. Testando...");
+}
+
+void loop() {
+  int32_t samples[I2S_READ_LEN];
+  size_t bytes_read = 0;
+  i2s_read(I2S_PORT, &samples, I2S_READ_LEN * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+  
+  double sum = 0;
+  for (int i = 0; i < I2S_READ_LEN; i++) {
+    double sample = samples[i] >> 14; 
+    sum += sample * sample;
+  }
+  double rms = sqrt(sum / I2S_READ_LEN);
+
+  Serial.print("RMS (Volume): ");
+  Serial.println(rms);
+  delay(100);
+}
