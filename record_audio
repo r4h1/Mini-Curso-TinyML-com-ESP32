@@ -1,0 +1,99 @@
+import serial
+import numpy as np
+import wave
+import time
+import os
+import matplotlib.pyplot as plt
+
+# --- Configuração ---
+SERIAL_PORT = 'COM3'  # ajuste conforme sua porta
+BAUD_RATE = 115200
+SAMPLE_RATE = 16000
+RECORD_SECONDS = 1
+NUM_CHANNELS = 1
+SAMPLE_WIDTH = 2
+
+def calculate_rms(samples):
+    """Calcula o nível RMS (intensidade média do sinal)"""
+    return np.sqrt(np.mean(np.square(samples.astype(np.float32))))
+
+def plot_audio(samples):
+    """Mostra o gráfico do áudio capturado"""
+    plt.figure(figsize=(8, 3))
+    plt.plot(samples, color='blue')
+    plt.title("Forma de Onda do Áudio Capturado")
+    plt.xlabel("Amostras")
+    plt.ylabel("Amplitude")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def record_audio_debug(filename):
+    """Grava áudio usando handshake com o ESP32"""
+    print("\n--- INICIANDO NOVA GRAVAÇÃO ---")
+    try:
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=10) as ser:
+            print(f"[DEBUG] Porta serial {SERIAL_PORT} aberta com sucesso!")
+            time.sleep(2)
+            ser.flushInput()
+
+            print("[DEBUG] Enviando comando 'R'...")
+            ser.write(b'R')
+
+            print("[DEBUG] Aguardando resposta 'A' do ESP32...")
+            ack = ser.read(1)
+            if ack != b'A':
+                print(f"[ERRO] Handshake falhou! Recebeu: {ack}")
+                return
+
+            print("[DEBUG] Handshake OK. Gravando áudio...")
+            num_samples = SAMPLE_RATE * RECORD_SECONDS
+            expected_bytes = num_samples * SAMPLE_WIDTH
+
+            raw_data = ser.read(expected_bytes)
+            print(f"[DEBUG] Bytes recebidos: {len(raw_data)}")
+
+            if len(raw_data) < expected_bytes:
+                print("[ERRO] Dados incompletos recebidos.")
+                return
+
+            samples_16bit = np.frombuffer(raw_data, dtype=np.int16)
+
+            # --- Exibir gráfico e nível RMS ---
+            rms = calculate_rms(samples_16bit)
+            print(f"[INFO] Nível RMS: {rms:.2f}")
+            plot_audio(samples_16bit)
+
+            # --- Salvar arquivo WAV ---
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(NUM_CHANNELS)
+                wf.setsampwidth(SAMPLE_WIDTH)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(samples_16bit.tobytes())
+
+            print(f"\n>>> SUCESSO! Gravação salva em {filename} <<<\n")
+
+    except serial.SerialException:
+        print(f"\n[ERRO FATAL] Não foi possível abrir a porta {SERIAL_PORT}.")
+    except Exception as e:
+        print(f"\n[ERRO INESPERADO] {e}")
+
+if __name__ == '__main__':
+    os.makedirs('data/ligar', exist_ok=True)
+    os.makedirs('data/desligar', exist_ok=True)
+    os.makedirs('data/noise', exist_ok=True)
+
+    print("--- Gravador de Áudio (Mono 16 bits + RMS + Gráfico) ---")
+
+    while True:
+        keyword = input("Digite ('ligar', 'desligar', 'noise', ou 'exit'): ").lower()
+        if keyword == 'exit':
+            break
+        if keyword not in ['ligar', 'desligar', 'noise']:
+            print("Palavra inválida.")
+            continue
+
+        count = len(os.listdir(f'data/{keyword}'))
+        filename = f'data/{keyword}/{keyword}_{count+1}.wav'
+        input("Pressione Enter para iniciar a gravação...")
+        record_audio_debug(filename)
