@@ -1,0 +1,221 @@
+/*
+ * Versão Final - Baseada no código funcional do usuário
+ * Usa PSRAM, I2S estável, nomes corretos e lê saída Float32.
+ */
+#include "driver/i2s.h"
+#include <arduinoFFT.h> // Renomeado para <ArduinoFFT.h> por padrão
+
+// Includes da biblioteca oficial TFLite (v0.3.0)
+#include "TensorFlowLite_ESP32.h" 
+#include "tensorflow/lite/experimental/micro/micro_error_reporter.h"
+#include "tensorflow/lite/experimental/micro/micro_interpreter.h"
+#include "tensorflow/lite/experimental/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+#include "tensorflow/lite/experimental/micro/kernels/all_ops_resolver.h" // Inclui todas as ops
+
+// Use o SEU NOVO model.h (Float32, treinado com TF 2.16.1)
+#include "model.h"
+
+#define LED_PIN 2
+
+// --- Configurações ---
+#define N_KEYWORDS 3
+#define N_SAMPLES 16000
+#define SPECTROGRAM_ROWS 32
+#define SPECTROGRAM_COLS 32
+const char* KEYWORDS[N_KEYWORDS] = {"Ligar", "Desligar", "Noise"};
+
+// --- OBJETOS DO TENSORFLOW LITE ---
+#define ARENA_SIZE 40 * 1024 // Mantendo um tamanho seguro
+tflite::ErrorReporter* error_reporter = nullptr;
+const tflite::Model* model = nullptr;
+tflite::MicroInterpreter* interpreter = nullptr;
+TfLiteTensor* model_input = nullptr;
+TfLiteTensor* model_output = nullptr;
+uint8_t tensor_arena[ARENA_SIZE];
+
+// --- OBJETOS DO ARDUINOFFT ---
+const uint16_t FFT_SAMPLES = 256;
+double vReal[FFT_SAMPLES];
+double vImag[FFT_SAMPLES];
+ArduinoFFT<double> fft(vReal, vImag, FFT_SAMPLES, N_SAMPLES);
+
+// --- BUFFERS DE ÁUDIO NA PSRAM ---
+int32_t* raw_samples;
+int16_t* samples_16bit;
+
+// --- Configurações do I2S ---
+#define I2S_PORT i2s_port_t(0)
+#define I2S_BCK_IO GPIO_NUM_14
+#define I2S_WS_IO GPIO_NUM_15
+#define I2S_DI_IO GPIO_NUM_32
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000); 
+    Serial.println("Iniciando sistema de IA no ESP32 WROVER (Base Funcional)..."); // Mensagem atualizada
+
+    if (psramFound()) {
+        Serial.println("==> SUCESSO! PSRAM encontrada.");
+        Serial.printf("Memória PSRAM total: %d bytes\n", ESP.getPsramSize()); 
+    } else {
+        Serial.println("==> ATENÇÃO! PSRAM não foi encontrada!");
+        while(1);
+    }
+
+    Serial.println("Alocando buffers de áudio na PSRAM...");
+    raw_samples = (int32_t*) ps_malloc(N_SAMPLES * sizeof(int32_t));
+    samples_16bit = (int16_t*) ps_malloc(N_SAMPLES * sizeof(int16_t));
+    if (raw_samples == NULL || samples_16bit == NULL) {
+        Serial.println("Falha ao alocar memória na PSRAM!");
+        while(1);
+    }
+    Serial.println("Buffers alocados com sucesso.");
+
+    pinMode(LED_PIN, OUTPUT);
+    
+    // Configuração do I2S (estável)
+    i2s_config_t i2s_config = {
+        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = N_SAMPLES,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_STAND_I2S),
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 16,
+        .dma_buf_len = 128,
+        .use_apll = false
+    };
+
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCK_IO,
+        .ws_io_num = I2S_WS_IO,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = I2S_DI_IO
+    };
+
+    i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_PORT, &pin_config);
+    i2s_zero_dma_buffer(I2S_PORT);
+
+    // --- CONFIGURAÇÃO DO TENSORFLOW LITE (SINTAXE ANTIGA v0.3.0) ---
+    static tflite::MicroErrorReporter micro_error_reporter;
+    error_reporter = &micro_error_reporter;
+
+    // CORREÇÃO 1: Usando g_model
+    model = tflite::GetModel(g_model); 
+    // Verificação de versão removida (correto para v0.3.0)
+    
+    // Usando o AllOpsResolver (correto para v0.3.0)
+    static tflite::ops::micro::AllOpsResolver resolver; 
+    // CORREÇÃO 2: A linha AddFullyConnected() foi removida, pois AllOpsResolver já inclui tudo.
+
+    static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, ARENA_SIZE, error_reporter);
+    interpreter = &static_interpreter;
+    if (interpreter->AllocateTensors() != kTfLiteOk) {
+        error_reporter->Report("Falha ao alocar tensores! ARENA_SIZE=%d", ARENA_SIZE); 
+        while(1);
+    }
+    model_input = interpreter->input(0);
+    model_output = interpreter->output(0);
+    
+    Serial.println("Modelo inicializado com sucesso!"); // Mensagem simplificada
+}
+
+void loop() {
+    Serial.println("Ouvindo...");
+    
+    size_t bytes_read = 0;
+    i2s_read(I2S_PORT, (void*)raw_samples, N_SAMPLES * sizeof(int32_t), &bytes_read, portMAX_DELAY);
+   
+    for (int i = 0; i < N_SAMPLES; i++) {
+        samples_16bit[i] = raw_samples[i] >> 14;
+    }
+
+    //Serial.printf("Amostra 100: %d | Amostra 500: %d | Amostra 1000: %d\n", 
+    //            samples_16bit[100], samples_16bit[500], samples_16bit[1000]);
+
+    float spectrogram_input[SPECTROGRAM_ROWS][SPECTROGRAM_COLS] = {0};
+    int step = N_SAMPLES / SPECTROGRAM_COLS;
+
+    // Lógica do Espectrograma
+    for (int col = 0; col < SPECTROGRAM_COLS; col++) {
+        int start_index = col * step;
+        for (int i = 0; i < FFT_SAMPLES; i++) {
+            vReal[i] = (start_index + i < N_SAMPLES) ? samples_16bit[start_index + i] : 0;
+            vImag[i] = 0;
+        }
+        fft.windowing(vReal, FFT_SAMPLES, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+        fft.compute(vReal, vImag, FFT_SAMPLES, FFT_FORWARD);
+        fft.complexToMagnitude(vReal, vImag, FFT_SAMPLES);
+        
+        int bins_per_row = (FFT_SAMPLES / 2) / SPECTROGRAM_ROWS;
+        for (int row = 0; row < SPECTROGRAM_ROWS; row++) {
+            double sum = 0;
+            for (int i = 0; i < bins_per_row; i++) {
+                int index = row * bins_per_row + i;
+                if (index < (FFT_SAMPLES / 2)) { // Apenas a primeira metade dos resultados da FFT é útil
+                   sum += vReal[index];
+                }   
+            }
+            // Evita divisão por zero se bins_per_row for 0
+            spectrogram_input[row][col] = (bins_per_row > 0) ? (float)(sum / bins_per_row) : 0.0f;
+        }
+    }
+
+    Serial.printf("  Spectrograma (canto sup esq): %.2f | (meio): %.2f | (canto inf dir): %.2f\n",
+                  spectrogram_input[0][0],        // Valor no canto superior esquerdo
+                  spectrogram_input[15][15],      // Valor no meio
+                  spectrogram_input[SPECTROGRAM_ROWS-1][SPECTROGRAM_COLS-1]); // Canto inferior direito
+    
+    // Copia para a entrada do modelo (forma antiga)
+    //for (int i = 0; i < SPECTROGRAM_ROWS * SPECTROGRAM_COLS; i++) {
+    //    model_input->data.f[i] = ((float*)spectrogram_input)[i];
+    //}
+    
+    // --- CORREÇÃO: Copiando para a entrada do modelo (Forma Explícita e Segura) ---
+    int input_index = 0;
+    for (int row = 0; row < SPECTROGRAM_ROWS; row++) {
+        for (int col = 0; col < SPECTROGRAM_COLS; col++) {
+            model_input->data.f[input_index++] = spectrogram_input[row][col];
+        }
+    }
+
+    // Executa a inferência
+    if (interpreter->Invoke() != kTfLiteOk) {
+        error_reporter->Report("Falha ao executar o modelo!");
+        return;
+    }
+    
+
+    // CORREÇÃO 3: Lendo a saída como Float32 (correspondendo ao novo model.h)
+    int predicted_idx = -1;
+    float max_prob = 0;
+    for (int i = 0; i < N_KEYWORDS; i++) {
+        float prob = interpreter->output(0)->data.f[i]; // Lendo como float
+        if (prob > max_prob) {
+            max_prob = prob;
+            predicted_idx = i;
+        }
+    }
+    
+    Serial.printf("  => Probs: Ligar=%.2f, Desligar=%.2f, Noise=%.2f\n",
+                  interpreter->output(0)->data.f[0], // Prob Ligar
+                  interpreter->output(0)->data.f[1], // Prob Desligar
+                  interpreter->output(0)->data.f[2]); // Prob Noise
+
+    // Lógica de decisão e controle do LED
+    if (predicted_idx != -1 && max_prob > 0.85) { // Limiar de confiança (ajuste se necessário)
+        const char* predicted_keyword = KEYWORDS[predicted_idx];
+        Serial.printf("---------------------> %s DETECTADO! (%.2f%%)\n",
+                      predicted_keyword, max_prob * 100);
+
+        if (strcmp(predicted_keyword, "Ligar") == 0) {
+            digitalWrite(LED_PIN, HIGH);
+        } else if (strcmp(predicted_keyword, "Desligar") == 0) {
+            digitalWrite(LED_PIN, LOW);
+        }
+    }
+
+    delay(200); // Atraso de 200ms
+}
